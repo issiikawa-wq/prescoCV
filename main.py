@@ -1,6 +1,7 @@
 import os
 import time
 import csv
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
@@ -120,16 +121,46 @@ def login_and_download_csv():
         finally:
             browser.close()
 
+def extract_gclid(url):
+    """URLからgclidの値を抽出する"""
+    if not url:
+        return ""
+    match = re.search(r'gclid=([^&]+)', url)
+    if match:
+        return match.group(1)
+    return ""
+
 def read_csv_data(csv_path):
-    """ダウンロードしたCSVを読み込む"""
+    """ダウンロードしたCSVを読み込み、gclid列を追加して返す"""
     encodings = ['utf-8-sig', 'utf-8', 'shift_jis', 'cp932']
     for encoding in encodings:
         try:
             with open(csv_path, 'r', encoding=encoding) as f:
                 reader = csv.reader(f)
-                return list(reader)
+                data = list(reader)
+                
+                if not data:
+                    return []
+                
+                # 1行目（ヘッダー）のM列(インデックス12)の隣に「GCLID」列を追加
+                if len(data[0]) > 12:
+                    data[0].insert(13, "GCLID")
+                
+                # 2行目以降のデータ処理
+                for row in data[1:]:
+                    if len(row) > 12:
+                        referrer_url = row[12]
+                        gclid_value = extract_gclid(referrer_url)
+                        row.insert(13, gclid_value)
+                    else:
+                        # M列が存在しない短い行の場合は空文字を追加
+                        row.append("")
+                        
+                return data
+                
         except UnicodeDecodeError:
             continue
+            
     raise Exception("CSVファイルの読み込みに失敗しました")
 
 def upload_to_spreadsheet(csv_path):
