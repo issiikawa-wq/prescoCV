@@ -65,13 +65,18 @@ def login_and_download_csv():
                 page.click('label:has-text("成果判定日時")', timeout=3000)
                 time.sleep(1)
             except:
-                print(f"[{datetime.now()}] 警告: 集計基準の変更に失敗しました")
+                print(f"[{datetime.now()}] 警告: 集計基準の変更に失敗しました（デフォルトのまま続行）")
 
-            # 期間を「先月1日〜今日」に変更
+            # 期間を「先月1日〜今日」に変更（確実に入力させる処理）
             date_from, date_to = get_target_date_range()
             print(f"[{datetime.now()}] 期間を {date_from} 〜 {date_to} に設定します")
-            page.evaluate(f'document.getElementById("dateTimeFrom").value = "{date_from}"')
-            page.evaluate(f'document.getElementById("dateTimeTo").value = "{date_to}"')
+            
+            # fillを使って人間が打ち込むように入力し、Enterで確定させる
+            page.fill('#dateTimeFrom', date_from)
+            page.press('#dateTimeFrom', 'Enter')
+            time.sleep(1)
+            page.fill('#dateTimeTo', date_to)
+            page.press('#dateTimeTo', 'Enter')
             time.sleep(1)
             
             # 検索ボタンクリック
@@ -86,7 +91,7 @@ def login_and_download_csv():
                 page.click('#csv-link')
             
             download = download_info.value
-            csv_path = f'/tmp/presco_data.csv'
+            csv_path = '/tmp/presco_data.csv'
             download.save_as(csv_path)
             print(f"[{datetime.now()}] CSVを保存しました: {csv_path}")
             
@@ -121,7 +126,7 @@ def upload_to_spreadsheet(csv_path):
     
     spreadsheet = gc.open_by_key(spreadsheet_id)
     
-    # 転記先のシート名を指定（存在しなければ作成）
+    # 指定のシート名
     sheet_name = 'PrescoCV' 
     try:
         worksheet = spreadsheet.worksheet(sheet_name)
