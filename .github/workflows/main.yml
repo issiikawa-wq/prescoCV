@@ -1,10 +1,7 @@
 name: Presco Scraper
 
 on:
-  schedule:
-# 15分ごとに実行
-    - cron: '*/15 * * * *'
-  workflow_dispatch: # 手動実行用のトリガー
+  workflow_dispatch: # ← GASからリモコンで押せるようにする魔法の言葉
 
 jobs:
   scrape-and-upload:
