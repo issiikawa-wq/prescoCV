@@ -71,17 +71,37 @@ def login_and_download_csv():
             date_from, date_to = get_target_date_range()
             print(f"[{datetime.now()}] 期間を {date_from} 〜 {date_to} に設定します")
             
-            # fillを使って人間が打ち込むように入力し、Enterで確定させる
+            # Enterキーの誤爆を防ぐため、fillとJavaScriptのchangeイベントを使用
             page.fill('#dateTimeFrom', date_from)
-            page.press('#dateTimeFrom', 'Enter')
-            time.sleep(1)
-            page.fill('#dateTimeTo', date_to)
-            page.press('#dateTimeTo', 'Enter')
+            page.evaluate('document.getElementById("dateTimeFrom").dispatchEvent(new Event("change", { bubbles: true }))')
             time.sleep(1)
             
-            # 検索ボタンクリック
+            page.fill('#dateTimeTo', date_to)
+            page.evaluate('document.getElementById("dateTimeTo").dispatchEvent(new Event("change", { bubbles: true }))')
+            time.sleep(1)
+            
+            # 検索ボタンクリック（複数のセレクタでアタックする）
             print(f"[{datetime.now()}] 検索条件で絞り込むをクリックします")
-            page.click('input[type="submit"][value="検索条件で絞り込む"]')
+            selectors = [
+                'span.text:has-text("検索条件で絞り込む")',
+                'span:has-text("検索条件で絞り込む")',
+                'text="検索条件で絞り込む"'
+            ]
+            
+            clicked = False
+            for selector in selectors:
+                try:
+                    # 5秒ずつ各セレクタを試す
+                    page.click(selector, timeout=5000)
+                    clicked = True
+                    print(f"[{datetime.now()}] 成功: {selector} でクリックしました")
+                    break
+                except:
+                    continue
+            
+            if not clicked:
+                raise Exception("検索ボタンの特定・クリックに失敗しました")
+                
             time.sleep(5)
             
             # CSVダウンロード
