@@ -14,6 +14,9 @@ LOG_SHEET_NAME = 'LogSummary'
 CV_SHEET_NAME = 'PrescoCV'
 CAMPAIGN_START_DATE = datetime(2025, 11, 27, tzinfo=ZoneInfo("Asia/Tokyo"))
 LOOKBACK_MONTHS = 6
+BATCH_ROWS = 500          # 一度に書き込む行数
+MAX_RETRIES = 3           # API失敗時のリトライ回数
+RETRY_WAIT_SEC = 10       # リトライまでの待機秒数
 
 
 def get_data_start_date():
@@ -21,7 +24,6 @@ def get_data_start_date():
     JST = ZoneInfo("Asia/Tokyo")
     today = datetime.now(JST)
 
-    # 半年前の日付を計算
     year, month = today.year, today.month - LOOKBACK_MONTHS
     if month <= 0:
         month += 12
@@ -29,15 +31,12 @@ def get_data_start_date():
     try:
         six_months_ago = today.replace(year=year, month=month)
     except ValueError:
-        # 月末日問題（例：8/31の半年前=2/31は存在しない）→ 28日に丸める
         six_months_ago = today.replace(year=year, month=month, day=28)
 
-    # 配信開始日と半年前の遅い方を採用
     return max(CAMPAIGN_START_DATE, six_months_ago)
 
 
 def get_target_date_range():
-    """成果一覧用の日付範囲（配信開始日 or 半年前 〜 今日）"""
     JST = ZoneInfo("Asia/Tokyo")
     start = get_data_start_date()
     today = datetime.now(JST)
@@ -45,7 +44,6 @@ def get_target_date_range():
 
 
 def get_report_url():
-    """ログ集計用URL（配信開始日 or 半年前 〜 今日）"""
     JST = ZoneInfo("Asia/Tokyo")
     start = get_data_start_date()
     today = datetime.now(JST)
@@ -71,6 +69,56 @@ def extract_gclid(url):
     return match.group(1) if match else ""
 
 
+def col_num_to_letter(n):
+    """1始まりの列番号をA,B,...,Z,AA,...に変換"""
+    result = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        result = chr(65 + r) + result
+    return result
+
+
+def safe_update(worksheet, values, range_name, value_input_option='USER_ENTERED'):
+    """リトライ付きでupdateする"""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            worksheet.update(values=values, range_name=range_name,
+                             value_input_option=value_input_option)
+            return
+        except gspread.exceptions.APIError as e:
+            print(f"  ⚠ APIエラー (試行 {attempt}/{MAX_RETRIES}): {e}")
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(RETRY_WAIT_SEC * attempt)  # 指数バックオフ風
+
+
+def upload_in_batches(worksheet, processed_data):
+    """データをバッチ分割して書き込む"""
+    if not processed_data:
+        return
+
+    num_cols = max(len(row) for row in processed_data)
+    last_col = col_num_to_letter(num_cols)
+
+    # ヘッダーは1行目に書く
+    header = processed_data[0]
+    safe_update(worksheet, [header], f"A1:{last_col}1")
+
+    # データ行はBATCH_ROWS行ごとに分割書き込み
+    data_rows = processed_data[1:]
+    total = len(data_rows)
+    print(f"  データ行数: {total} 行 / 列数: {num_cols} / バッチサイズ: {BATCH_ROWS}")
+
+    for i in range(0, total, BATCH_ROWS):
+        chunk = data_rows[i:i + BATCH_ROWS]
+        start_row = i + 2  # 1始まり、ヘッダーの次から
+        end_row = start_row + len(chunk) - 1
+        range_name = f"A{start_row}:{last_col}{end_row}"
+        print(f"  書き込み中: {range_name} ({len(chunk)}行)")
+        safe_update(worksheet, chunk, range_name)
+        time.sleep(1)  # APIレート制限緩和
+
+
 def process_and_upload(csv_path, sheet_name, is_cv_data=False):
     """CSVを読み込んで数値変換し、指定のシートにアップロードする共通関数"""
     print(f"[{datetime.now()}] {sheet_name} への転記を開始します")
@@ -92,19 +140,15 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
         return
 
     # --- 数値変換処理 ---
-    # CSVは全データが文字列として読み込まれるため、数値に変換可能なセルをキャストする
     processed_data = []
     for i, row in enumerate(raw_data):
-        if i == 0:  # ヘッダー行はそのまま
+        if i == 0:
             processed_data.append(row)
             continue
 
         new_row = []
         for cell in row:
-            # カンマを除去（例: "1,200" -> "1200"）
             clean_val = cell.replace(',', '')
-
-            # 数値変換を試行
             try:
                 if clean_val == "":
                     new_row.append("")
@@ -113,18 +157,15 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
                 else:
                     new_row.append(int(clean_val))
             except ValueError:
-                # 数値にできない場合は元の文字列（日付やIDなど）のまま
                 new_row.append(cell)
         processed_data.append(new_row)
 
     # 成果一覧（CVデータ）の場合のみGCLID抽出処理を実行
     if is_cv_data:
-        # ヘッダーにGCLID追加
         if len(processed_data[0]) > 12:
             processed_data[0].insert(13, "GCLID")
             for row in processed_data[1:]:
                 if len(row) > 12:
-                    # row[12]は参照元URL
                     row.insert(13, extract_gclid(str(row[12])))
                 else:
                     row.append("")
@@ -145,12 +186,12 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
     try:
         worksheet = spreadsheet.worksheet(sheet_name)
     except:
-        worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=20)
+        worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=10000, cols=30)
 
     worksheet.clear()
 
-    # value_input_option='USER_ENTERED' を使うことで数値や日付が適切に処理されます
-    worksheet.update(values=processed_data, range_name="A1", value_input_option='USER_ENTERED')
+    # バッチ書き込み（500エラー対策）
+    upload_in_batches(worksheet, processed_data)
     print(f"[{datetime.now()}] {sheet_name} 完了")
 
 
@@ -161,7 +202,6 @@ def main():
     if not email or not password:
         raise Exception("PRESCOのログイン情報が環境変数に設定されていません")
 
-    # 取得期間をログ出力（デバッグ用）
     date_from, date_to = get_target_date_range()
     print(f"[{datetime.now()}] 取得期間: {date_from} 〜 {date_to}")
 
@@ -202,9 +242,7 @@ def main():
             download_info.value.save_as(log_csv_path)
 
             # --- 4. スプレッドシートへ転記 ---
-            # 成果一覧のアップロード
             process_and_upload(cv_csv_path, CV_SHEET_NAME, is_cv_data=True)
-            # ログ集計のアップロード
             process_and_upload(log_csv_path, LOG_SHEET_NAME, is_cv_data=False)
 
         finally:
