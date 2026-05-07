@@ -10,41 +10,71 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # --- 設定 ---
-LOG_SHEET_NAME = 'LogSummary' 
+LOG_SHEET_NAME = 'LogSummary'
 CV_SHEET_NAME = 'PrescoCV'
+CAMPAIGN_START_DATE = datetime(2025, 11, 27, tzinfo=ZoneInfo("Asia/Tokyo"))
+LOOKBACK_MONTHS = 6
 
-def get_target_date_range():
-    """成果一覧用：先月1日から今日までの日付"""
+
+def get_data_start_date():
+    """取得開始日：配信開始日と半年前のうち、新しい方を返す"""
     JST = ZoneInfo("Asia/Tokyo")
     today = datetime.now(JST)
-    first_day_of_this_month = today.replace(day=1)
-    last_day_of_last_month = first_day_of_this_month - timedelta(days=1)
-    first_day_of_last_month = last_day_of_last_month.replace(day=1)
-    return first_day_of_last_month.strftime("%Y/%m/%d"), today.strftime("%Y/%m/%d")
+
+    # 半年前の日付を計算
+    year, month = today.year, today.month - LOOKBACK_MONTHS
+    if month <= 0:
+        month += 12
+        year -= 1
+    try:
+        six_months_ago = today.replace(year=year, month=month)
+    except ValueError:
+        # 月末日問題（例：8/31の半年前=2/31は存在しない）→ 28日に丸める
+        six_months_ago = today.replace(year=year, month=month, day=28)
+
+    # 配信開始日と半年前の遅い方を採用
+    return max(CAMPAIGN_START_DATE, six_months_ago)
+
+
+def get_target_date_range():
+    """成果一覧用の日付範囲（配信開始日 or 半年前 〜 今日）"""
+    JST = ZoneInfo("Asia/Tokyo")
+    start = get_data_start_date()
+    today = datetime.now(JST)
+    return start.strftime("%Y/%m/%d"), today.strftime("%Y/%m/%d")
+
 
 def get_report_url():
-    """ログ集計用：2025/12/08から今日までの動的URL"""
+    """ログ集計用URL（配信開始日 or 半年前 〜 今日）"""
     JST = ZoneInfo("Asia/Tokyo")
-    today_str = datetime.now(JST).strftime("%Y/%m/%d").replace("/", "%2F")
+    start = get_data_start_date()
+    today = datetime.now(JST)
+
+    date_from = start.strftime("%Y/%m/%d").replace("/", "%2F")
+    date_to = today.strftime("%Y/%m/%d").replace("/", "%2F")
+
     return (
         "https://presco.ai/partner/report/search?"
-        "searchDateTimeFrom=2025%2F12%2F08&"
-        f"searchDateTimeTo={today_str}&"
+        f"searchDateTimeFrom={date_from}&"
+        f"searchDateTimeTo={date_to}&"
         "searchItemType=2&searchPeriodType=4&searchProgramId=&"
         "searchDateType=3&searchPartnerSiteId=&searchProgramUrlId=&"
         "searchPartnerSitePageId=&searchLargeGenreId=&searchMediumGenreId=&"
         "searchSmallGenreId=&_searchJoinType=on"
     )
 
+
 def extract_gclid(url):
-    if not url: return ""
+    if not url:
+        return ""
     match = re.search(r'gclid=([^&]+)', url)
     return match.group(1) if match else ""
+
 
 def process_and_upload(csv_path, sheet_name, is_cv_data=False):
     """CSVを読み込んで数値変換し、指定のシートにアップロードする共通関数"""
     print(f"[{datetime.now()}] {sheet_name} への転記を開始します")
-    
+
     # CSV読み込み
     raw_data = []
     encodings = ['utf-8-sig', 'utf-8', 'shift_jis', 'cp932']
@@ -54,7 +84,8 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
                 reader = csv.reader(f)
                 raw_data = list(reader)
                 break
-        except: continue
+        except:
+            continue
 
     if not raw_data:
         print(f"警告: {csv_path} にデータがありません")
@@ -67,12 +98,12 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
         if i == 0:  # ヘッダー行はそのまま
             processed_data.append(row)
             continue
-        
+
         new_row = []
         for cell in row:
             # カンマを除去（例: "1,200" -> "1200"）
             clean_val = cell.replace(',', '')
-            
+
             # 数値変換を試行
             try:
                 if clean_val == "":
@@ -101,7 +132,7 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
     # Google Sheets 認証と書き込み
     creds_json = os.environ.get('GOOGLE_CREDENTIALS')
     spreadsheet_id = os.environ.get('SPREADSHEET_ID')
-    
+
     if not creds_json or not spreadsheet_id:
         raise Exception("Google Sheets関連の環境変数が設定されていません")
 
@@ -109,7 +140,7 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     gc = gspread.authorize(credentials)
-    
+
     spreadsheet = gc.open_by_key(spreadsheet_id)
     try:
         worksheet = spreadsheet.worksheet(sheet_name)
@@ -117,17 +148,22 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
         worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=20)
 
     worksheet.clear()
-    
+
     # value_input_option='USER_ENTERED' を使うことで数値や日付が適切に処理されます
     worksheet.update(values=processed_data, range_name="A1", value_input_option='USER_ENTERED')
     print(f"[{datetime.now()}] {sheet_name} 完了")
 
+
 def main():
     email = os.environ.get('PRESCO_EMAIL')
     password = os.environ.get('PRESCO_PASSWORD')
-    
+
     if not email or not password:
         raise Exception("PRESCOのログイン情報が環境変数に設定されていません")
+
+    # 取得期間をログ出力（デバッグ用）
+    date_from, date_to = get_target_date_range()
+    print(f"[{datetime.now()}] 取得期間: {date_from} 〜 {date_to}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
@@ -146,7 +182,6 @@ def main():
             # --- 2. 成果一覧CSVの処理 ---
             print(f"[{datetime.now()}] 成果一覧を取得します")
             page.goto('https://presco.ai/partner/actionLog/list')
-            date_from, date_to = get_target_date_range()
             page.fill('#dateTimeFrom', date_from)
             page.fill('#dateTimeTo', date_to)
             page.click('span:has-text("検索条件で絞り込む")')
@@ -155,7 +190,7 @@ def main():
                 page.click('#csv-link')
             cv_csv_path = '/tmp/cv_data.csv'
             download_info.value.save_as(cv_csv_path)
-            
+
             # --- 3. ログ集計CSVの処理 ---
             print(f"[{datetime.now()}] ログ集計を取得します")
             report_url = get_report_url()
@@ -174,6 +209,7 @@ def main():
 
         finally:
             browser.close()
+
 
 if __name__ == "__main__":
     main()
