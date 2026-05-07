@@ -14,9 +14,20 @@ LOG_SHEET_NAME = 'LogSummary'
 CV_SHEET_NAME = 'PrescoCV'
 CAMPAIGN_START_DATE = datetime(2025, 11, 27, tzinfo=ZoneInfo("Asia/Tokyo"))
 LOOKBACK_MONTHS = 6
-BATCH_ROWS = 500          # 一度に書き込む行数
-MAX_RETRIES = 3           # API失敗時のリトライ回数
-RETRY_WAIT_SEC = 10       # リトライまでの待機秒数
+
+# 差分更新設定
+OVERWRITE_DAYS = 3        # 直近何日分を上書きするか
+DATE_COL_INDEX = 0        # 日付が入っている列（0始まり）。A列=0
+FULL_REFRESH = True      # Trueにすると全件再取得モードに切り替わる
+
+# サイト名フィルタ設定（PrescoCVのみ適用）
+FILTER_ENABLED = True                # True にするとフィルタ有効化
+FILTER_KEYWORDS = ["介護", "看護"]    # サイト名に含まれる文字列（部分一致）
+SITE_NAME_COL_INDEX = 5               # F列=サイト名（0始まり）
+
+BATCH_ROWS = 500
+MAX_RETRIES = 3
+RETRY_WAIT_SEC = 10
 
 
 def get_data_start_date():
@@ -78,6 +89,32 @@ def col_num_to_letter(n):
     return result
 
 
+def parse_date_cell(cell_value):
+    """セルの値から日付部分(YYYY-MM-DD)を抽出。失敗時はNone"""
+    if not cell_value:
+        return None
+    s = str(cell_value).strip()
+    s_normalized = s.replace('/', '-').replace('.', '-')
+    match = re.match(r'(\d{4})-(\d{1,2})-(\d{1,2})', s_normalized)
+    if not match:
+        return None
+    try:
+        y, m, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        return datetime(y, m, d, tzinfo=ZoneInfo("Asia/Tokyo"))
+    except ValueError:
+        return None
+
+
+def matches_site_filter(row):
+    """サイト名フィルタにマッチするか判定（部分一致）"""
+    if not FILTER_ENABLED:
+        return True  # フィルタ無効なら常にTrue
+    if len(row) <= SITE_NAME_COL_INDEX:
+        return False
+    site_name = str(row[SITE_NAME_COL_INDEX])
+    return any(keyword in site_name for keyword in FILTER_KEYWORDS)
+
+
 def safe_update(worksheet, values, range_name, value_input_option='USER_ENTERED'):
     """リトライ付きでupdateする"""
     for attempt in range(1, MAX_RETRIES + 1):
@@ -89,7 +126,7 @@ def safe_update(worksheet, values, range_name, value_input_option='USER_ENTERED'
             print(f"  ⚠ APIエラー (試行 {attempt}/{MAX_RETRIES}): {e}")
             if attempt == MAX_RETRIES:
                 raise
-            time.sleep(RETRY_WAIT_SEC * attempt)  # 指数バックオフ風
+            time.sleep(RETRY_WAIT_SEC * attempt)
 
 
 def upload_in_batches(worksheet, processed_data):
@@ -100,30 +137,101 @@ def upload_in_batches(worksheet, processed_data):
     num_cols = max(len(row) for row in processed_data)
     last_col = col_num_to_letter(num_cols)
 
-    # ヘッダーは1行目に書く
     header = processed_data[0]
     safe_update(worksheet, [header], f"A1:{last_col}1")
 
-    # データ行はBATCH_ROWS行ごとに分割書き込み
     data_rows = processed_data[1:]
     total = len(data_rows)
     print(f"  データ行数: {total} 行 / 列数: {num_cols} / バッチサイズ: {BATCH_ROWS}")
 
+    if total == 0:
+        return
+
     for i in range(0, total, BATCH_ROWS):
         chunk = data_rows[i:i + BATCH_ROWS]
-        start_row = i + 2  # 1始まり、ヘッダーの次から
+        start_row = i + 2
         end_row = start_row + len(chunk) - 1
         range_name = f"A{start_row}:{last_col}{end_row}"
         print(f"  書き込み中: {range_name} ({len(chunk)}行)")
         safe_update(worksheet, chunk, range_name)
-        time.sleep(1)  # APIレート制限緩和
+        time.sleep(1)
 
 
-def process_and_upload(csv_path, sheet_name, is_cv_data=False):
-    """CSVを読み込んで数値変換し、指定のシートにアップロードする共通関数"""
-    print(f"[{datetime.now()}] {sheet_name} への転記を開始します")
+def merge_with_existing(new_data, existing_data, overwrite_days, apply_site_filter=False):
+    """
+    既存データと新規データをマージする。
+    - 直近N日分は新規データで置き換え
+    - それ以前は既存データを保持
+    - apply_site_filter=Trueの場合、既存データもフィルタにかける
+    """
+    if not new_data:
+        return existing_data
+    if not existing_data or len(existing_data) <= 1:
+        print(f"  既存データ空 → 新規データ全件を投入します")
+        if apply_site_filter:
+            header = new_data[0]
+            filtered = [row for row in new_data[1:] if matches_site_filter(row)]
+            print(f"  サイト名フィルタ適用: {len(new_data) - 1}行 → {len(filtered)}行")
+            return [header] + filtered
+        return new_data
 
-    # CSV読み込み
+    JST = ZoneInfo("Asia/Tokyo")
+    today = datetime.now(JST).replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff_date = today - timedelta(days=overwrite_days - 1)
+    print(f"  上書き境界日: {cutoff_date.strftime('%Y-%m-%d')} 以降を新規データで置換")
+
+    header = new_data[0]
+
+    # 既存データから「cutoff_date より前」の行のみ残す
+    kept_old_rows = []
+    discarded_old_rows = 0
+    unparsable_rows = 0
+    filtered_out_old = 0
+    for row in existing_data[1:]:
+        if len(row) <= DATE_COL_INDEX:
+            unparsable_rows += 1
+            kept_old_rows.append(row)
+            continue
+        row_date = parse_date_cell(row[DATE_COL_INDEX])
+        if row_date is None:
+            unparsable_rows += 1
+            kept_old_rows.append(row)
+            continue
+        if row_date < cutoff_date:
+            # 既存の古い行：フィルタ適用が指示されていればチェック
+            if apply_site_filter and not matches_site_filter(row):
+                filtered_out_old += 1
+                continue
+            kept_old_rows.append(row)
+        else:
+            discarded_old_rows += 1
+
+    # 新規データから「cutoff_date 以降」の行を抽出
+    new_recent_rows = []
+    filtered_out_new = 0
+    for row in new_data[1:]:
+        if len(row) <= DATE_COL_INDEX:
+            continue
+        row_date = parse_date_cell(row[DATE_COL_INDEX])
+        if row_date is None:
+            continue
+        if row_date >= cutoff_date:
+            # 新規の最近行：フィルタ適用が指示されていればチェック
+            if apply_site_filter and not matches_site_filter(row):
+                filtered_out_new += 1
+                continue
+            new_recent_rows.append(row)
+
+    print(f"  既存維持: {len(kept_old_rows)}行 / 既存破棄: {discarded_old_rows}行 / "
+          f"日付解析不能: {unparsable_rows}行 / 新規追加: {len(new_recent_rows)}行")
+    if apply_site_filter:
+        print(f"  サイト名フィルタで除外: 既存 {filtered_out_old}行 / 新規 {filtered_out_new}行")
+
+    return [header] + kept_old_rows + new_recent_rows
+
+
+def process_csv_to_data(csv_path, is_cv_data=False):
+    """CSVを読み込んで数値変換とGCLID抽出を行い、二次元リストを返す"""
     raw_data = []
     encodings = ['utf-8-sig', 'utf-8', 'shift_jis', 'cp932']
     for enc in encodings:
@@ -136,16 +244,14 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
             continue
 
     if not raw_data:
-        print(f"警告: {csv_path} にデータがありません")
-        return
+        return []
 
-    # --- 数値変換処理 ---
+    # 数値変換
     processed_data = []
     for i, row in enumerate(raw_data):
         if i == 0:
             processed_data.append(row)
             continue
-
         new_row = []
         for cell in row:
             clean_val = cell.replace(',', '')
@@ -160,7 +266,9 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
                 new_row.append(cell)
         processed_data.append(new_row)
 
-    # 成果一覧（CVデータ）の場合のみGCLID抽出処理を実行
+    # GCLID列の追加（CVデータのみ）
+    # 注意：GCLID列を13列目に挿入するため、それ以前にサイト名フィルタを実行する必要があるなら
+    # SITE_NAME_COL_INDEX=5 はGCLID挿入の影響を受けない（5 < 13）
     if is_cv_data:
         if len(processed_data[0]) > 12:
             processed_data[0].insert(13, "GCLID")
@@ -170,7 +278,24 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
                 else:
                     row.append("")
 
-    # Google Sheets 認証と書き込み
+    return processed_data
+
+
+def process_and_upload(csv_path, sheet_name, is_cv_data=False):
+    """CSVを読み込んで、既存データとマージしてシートに書き込む"""
+    print(f"[{datetime.now()}] {sheet_name} への転記を開始します")
+
+    new_data = process_csv_to_data(csv_path, is_cv_data=is_cv_data)
+    if not new_data:
+        print(f"警告: {csv_path} にデータがありません")
+        return
+
+    # サイト名フィルタはPrescoCV（is_cv_data=True）のみ適用
+    apply_site_filter = is_cv_data and FILTER_ENABLED
+    if apply_site_filter:
+        print(f"  サイト名フィルタ有効: {FILTER_KEYWORDS} のいずれかを含む行のみ書き込み")
+
+    # Google Sheets 認証
     creds_json = os.environ.get('GOOGLE_CREDENTIALS')
     spreadsheet_id = os.environ.get('SPREADSHEET_ID')
 
@@ -183,15 +308,30 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
     gc = gspread.authorize(credentials)
 
     spreadsheet = gc.open_by_key(spreadsheet_id)
+    sheet_exists = True
     try:
         worksheet = spreadsheet.worksheet(sheet_name)
     except:
         worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=10000, cols=30)
+        sheet_exists = False
+
+    # データ準備
+    if FULL_REFRESH or not sheet_exists:
+        print(f"  {'全件再取得モード' if FULL_REFRESH else 'シート新規作成のため全件投入'}")
+        if apply_site_filter:
+            header = new_data[0]
+            filtered = [row for row in new_data[1:] if matches_site_filter(row)]
+            print(f"  サイト名フィルタ適用: {len(new_data) - 1}行 → {len(filtered)}行")
+            final_data = [header] + filtered
+        else:
+            final_data = new_data
+    else:
+        existing_data = worksheet.get_all_values()
+        final_data = merge_with_existing(new_data, existing_data, OVERWRITE_DAYS,
+                                         apply_site_filter=apply_site_filter)
 
     worksheet.clear()
-
-    # バッチ書き込み（500エラー対策）
-    upload_in_batches(worksheet, processed_data)
+    upload_in_batches(worksheet, final_data)
     print(f"[{datetime.now()}] {sheet_name} 完了")
 
 
@@ -204,6 +344,9 @@ def main():
 
     date_from, date_to = get_target_date_range()
     print(f"[{datetime.now()}] 取得期間: {date_from} 〜 {date_to}")
+    print(f"[{datetime.now()}] モード: {'全件再取得' if FULL_REFRESH else f'直近{OVERWRITE_DAYS}日のみ上書き'}")
+    print(f"[{datetime.now()}] サイト名フィルタ: "
+          f"{'有効 (' + ', '.join(FILTER_KEYWORDS) + ')' if FILTER_ENABLED else '無効'}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
