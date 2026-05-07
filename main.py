@@ -18,14 +18,14 @@ LOOKBACK_MONTHS = 6
 # 差分更新設定（PrescoCVのみ適用）
 OVERWRITE_DAYS = 3        # 直近何日分を上書きするか
 DATE_COL_INDEX = 0        # 日付が入っている列（0始まり）。A列=0
-FULL_REFRESH = False      # Trueにすると全件再取得モードに切り替わる
+FULL_REFRESH = True      # Trueにすると全件再取得モードに切り替わる
 
 # サイト名フィルタ設定（PrescoCVのみ適用）
 FILTER_ENABLED = True                # True にするとフィルタ有効化
 FILTER_KEYWORDS = ["介護", "看護"]    # サイト名に含まれる文字列（部分一致）
 SITE_NAME_COL_INDEX = 5               # F列=サイト名（0始まり）
 
-BATCH_ROWS = 500
+BATCH_ROWS = 1000
 MAX_RETRIES = 3
 RETRY_WAIT_SEC = 10
 
