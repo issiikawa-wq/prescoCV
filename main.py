@@ -15,7 +15,7 @@ CV_SHEET_NAME = 'PrescoCV'
 CAMPAIGN_START_DATE = datetime(2025, 11, 27, tzinfo=ZoneInfo("Asia/Tokyo"))
 LOOKBACK_MONTHS = 6
 
-# 差分更新設定
+# 差分更新設定（PrescoCVのみ適用）
 OVERWRITE_DAYS = 3        # 直近何日分を上書きするか
 DATE_COL_INDEX = 0        # 日付が入っている列（0始まり）。A列=0
 FULL_REFRESH = False      # Trueにすると全件再取得モードに切り替わる
@@ -108,7 +108,7 @@ def parse_date_cell(cell_value):
 def matches_site_filter(row):
     """サイト名フィルタにマッチするか判定（部分一致）"""
     if not FILTER_ENABLED:
-        return True  # フィルタ無効なら常にTrue
+        return True
     if len(row) <= SITE_NAME_COL_INDEX:
         return False
     site_name = str(row[SITE_NAME_COL_INDEX])
@@ -159,7 +159,7 @@ def upload_in_batches(worksheet, processed_data):
 
 def merge_with_existing(new_data, existing_data, overwrite_days, apply_site_filter=False):
     """
-    既存データと新規データをマージする。
+    既存データと新規データをマージする（PrescoCV用）。
     - 直近N日分は新規データで置き換え
     - それ以前は既存データを保持
     - apply_site_filter=Trueの場合、既存データもフィルタにかける
@@ -182,7 +182,6 @@ def merge_with_existing(new_data, existing_data, overwrite_days, apply_site_filt
 
     header = new_data[0]
 
-    # 既存データから「cutoff_date より前」の行のみ残す
     kept_old_rows = []
     discarded_old_rows = 0
     unparsable_rows = 0
@@ -198,7 +197,6 @@ def merge_with_existing(new_data, existing_data, overwrite_days, apply_site_filt
             kept_old_rows.append(row)
             continue
         if row_date < cutoff_date:
-            # 既存の古い行：フィルタ適用が指示されていればチェック
             if apply_site_filter and not matches_site_filter(row):
                 filtered_out_old += 1
                 continue
@@ -206,7 +204,6 @@ def merge_with_existing(new_data, existing_data, overwrite_days, apply_site_filt
         else:
             discarded_old_rows += 1
 
-    # 新規データから「cutoff_date 以降」の行を抽出
     new_recent_rows = []
     filtered_out_new = 0
     for row in new_data[1:]:
@@ -216,7 +213,6 @@ def merge_with_existing(new_data, existing_data, overwrite_days, apply_site_filt
         if row_date is None:
             continue
         if row_date >= cutoff_date:
-            # 新規の最近行：フィルタ適用が指示されていればチェック
             if apply_site_filter and not matches_site_filter(row):
                 filtered_out_new += 1
                 continue
@@ -246,7 +242,6 @@ def process_csv_to_data(csv_path, is_cv_data=False):
     if not raw_data:
         return []
 
-    # 数値変換
     processed_data = []
     for i, row in enumerate(raw_data):
         if i == 0:
@@ -267,8 +262,6 @@ def process_csv_to_data(csv_path, is_cv_data=False):
         processed_data.append(new_row)
 
     # GCLID列の追加（CVデータのみ）
-    # 注意：GCLID列を13列目に挿入するため、それ以前にサイト名フィルタを実行する必要があるなら
-    # SITE_NAME_COL_INDEX=5 はGCLID挿入の影響を受けない（5 < 13）
     if is_cv_data:
         if len(processed_data[0]) > 12:
             processed_data[0].insert(13, "GCLID")
@@ -281,21 +274,8 @@ def process_csv_to_data(csv_path, is_cv_data=False):
     return processed_data
 
 
-def process_and_upload(csv_path, sheet_name, is_cv_data=False):
-    """CSVを読み込んで、既存データとマージしてシートに書き込む"""
-    print(f"[{datetime.now()}] {sheet_name} への転記を開始します")
-
-    new_data = process_csv_to_data(csv_path, is_cv_data=is_cv_data)
-    if not new_data:
-        print(f"警告: {csv_path} にデータがありません")
-        return
-
-    # サイト名フィルタはPrescoCV（is_cv_data=True）のみ適用
-    apply_site_filter = is_cv_data and FILTER_ENABLED
-    if apply_site_filter:
-        print(f"  サイト名フィルタ有効: {FILTER_KEYWORDS} のいずれかを含む行のみ書き込み")
-
-    # Google Sheets 認証
+def get_worksheet(sheet_name):
+    """Google Sheets認証してワークシートを取得"""
     creds_json = os.environ.get('GOOGLE_CREDENTIALS')
     spreadsheet_id = os.environ.get('SPREADSHEET_ID')
 
@@ -314,8 +294,24 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
     except:
         worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=10000, cols=30)
         sheet_exists = False
+    return worksheet, sheet_exists
 
-    # データ準備
+
+def upload_cv_data(csv_path, sheet_name):
+    """PrescoCV用：差分更新＋サイト名フィルタ"""
+    print(f"[{datetime.now()}] {sheet_name} への転記を開始します（差分更新モード）")
+
+    new_data = process_csv_to_data(csv_path, is_cv_data=True)
+    if not new_data:
+        print(f"警告: {csv_path} にデータがありません")
+        return
+
+    apply_site_filter = FILTER_ENABLED
+    if apply_site_filter:
+        print(f"  サイト名フィルタ有効: {FILTER_KEYWORDS} のいずれかを含む行のみ書き込み")
+
+    worksheet, sheet_exists = get_worksheet(sheet_name)
+
     if FULL_REFRESH or not sheet_exists:
         print(f"  {'全件再取得モード' if FULL_REFRESH else 'シート新規作成のため全件投入'}")
         if apply_site_filter:
@@ -335,6 +331,21 @@ def process_and_upload(csv_path, sheet_name, is_cv_data=False):
     print(f"[{datetime.now()}] {sheet_name} 完了")
 
 
+def upload_log_data(csv_path, sheet_name):
+    """LogSummary用：シンプル全置換"""
+    print(f"[{datetime.now()}] {sheet_name} への転記を開始します（全置換モード）")
+
+    new_data = process_csv_to_data(csv_path, is_cv_data=False)
+    if not new_data:
+        print(f"警告: {csv_path} にデータがありません")
+        return
+
+    worksheet, _ = get_worksheet(sheet_name)
+    worksheet.clear()
+    upload_in_batches(worksheet, new_data)
+    print(f"[{datetime.now()}] {sheet_name} 完了")
+
+
 def main():
     email = os.environ.get('PRESCO_EMAIL')
     password = os.environ.get('PRESCO_PASSWORD')
@@ -344,7 +355,8 @@ def main():
 
     date_from, date_to = get_target_date_range()
     print(f"[{datetime.now()}] 取得期間: {date_from} 〜 {date_to}")
-    print(f"[{datetime.now()}] モード: {'全件再取得' if FULL_REFRESH else f'直近{OVERWRITE_DAYS}日のみ上書き'}")
+    print(f"[{datetime.now()}] PrescoCV: {'全件再取得' if FULL_REFRESH else f'直近{OVERWRITE_DAYS}日のみ上書き'}")
+    print(f"[{datetime.now()}] LogSummary: 全置換モード")
     print(f"[{datetime.now()}] サイト名フィルタ: "
           f"{'有効 (' + ', '.join(FILTER_KEYWORDS) + ')' if FILTER_ENABLED else '無効'}")
 
@@ -385,8 +397,8 @@ def main():
             download_info.value.save_as(log_csv_path)
 
             # --- 4. スプレッドシートへ転記 ---
-            process_and_upload(cv_csv_path, CV_SHEET_NAME, is_cv_data=True)
-            process_and_upload(log_csv_path, LOG_SHEET_NAME, is_cv_data=False)
+            upload_cv_data(cv_csv_path, CV_SHEET_NAME)       # 差分更新
+            upload_log_data(log_csv_path, LOG_SHEET_NAME)    # 全置換
 
         finally:
             browser.close()
