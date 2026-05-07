@@ -18,7 +18,7 @@ LOOKBACK_MONTHS = 6
 # 差分更新設定
 OVERWRITE_DAYS = 3        # 直近何日分を上書きするか
 DATE_COL_INDEX = 0        # 日付が入っている列（0始まり）。A列=0
-FULL_REFRESH = True      # Trueにすると全件再取得モードに切り替わる
+FULL_REFRESH = False      # Trueにすると全件再取得モードに切り替わる
 
 # サイト名フィルタ設定（PrescoCVのみ適用）
 FILTER_ENABLED = True                # True にするとフィルタ有効化
